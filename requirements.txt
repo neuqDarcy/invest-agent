@@ -1,0 +1,24 @@
+fastapi==0.115.0
+uvicorn==0.30.0
+python-multipart==0.0.9
+
+# PDF 解析
+pdfplumber==0.11.4
+PyMuPDF==1.25.5
+
+# LLM
+openai==1.51.0          # DeepSeek 兼容 OpenAI SDK
+
+# 数据源
+tushare>=1.4.0
+
+# 向量数据库
+chromadb==0.5.15
+
+# 数据存储
+sqlalchemy==2.0.35
+
+# 工具
+pydantic==2.9.0
+pydantic-settings==2.5.2
+python-dotenv==1.0.1

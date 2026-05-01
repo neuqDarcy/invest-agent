@@ -1,0 +1,30 @@
+# 环境变量（含 API Key）
+.env
+.env.local
+.env.prod
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 数据文件
+uploads/
+outputs/
+*.db
+chroma/
+logs/
+
+# 前端构建产物
+frontend/dist/
+frontend/node_modules/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
