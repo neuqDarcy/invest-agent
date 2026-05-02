@@ -8,6 +8,11 @@ class Settings(BaseSettings):
 
     tushare_token: str = ""
 
+    # LangSmith 追踪配置（可选，留空则不启用）
+    langchain_tracing_v2: str = ""
+    langchain_api_key: str = ""
+    langchain_project: str = "invest-agent"
+
     upload_dir: str = "./uploads"
     output_dir: str = "./outputs"
     db_path: str = "./report_agent.db"

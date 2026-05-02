@@ -97,6 +97,17 @@ def execute_tool(tool_name: str, tool_inputs: dict) -> str:
     """
     logger.info(f"工具调用: {tool_name}({json.dumps(tool_inputs, ensure_ascii=False)[:100]})")
     try:
+        from langsmith import traceable
+        return traceable(name=f"tool_{tool_name}", run_type="tool")(
+            lambda: _dispatch_tool(tool_name, tool_inputs)
+        )()
+    except Exception:
+        return _dispatch_tool(tool_name, tool_inputs)
+
+
+def _dispatch_tool(tool_name: str, tool_inputs: dict) -> str:
+    """实际工具路由与执行。"""
+    try:
         if tool_name == "deep_screen":
             return _run_deep_screen(tool_inputs)
         elif tool_name == "get_financials":

@@ -17,6 +17,19 @@ from app.agents.fund_manager.tools import TOOL_DEFINITIONS, execute_tool
 MAX_TURNS = 10
 
 
+def _get_tracer():
+    """返回 LangSmith traceable 装饰器，未配置时返回空操作装饰器。"""
+    try:
+        from langsmith import traceable
+        return traceable
+    except ImportError:
+        def noop(**_kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+        return noop
+
+
 @dataclass
 class Message:
     """
@@ -56,7 +69,7 @@ class AgentSession:
 def chat(
     session: AgentSession,
     user_message: str,
-) -> list[Message]:
+) -> list[Message]:  # noqa: F811
     """
     处理一轮用户消息（同步版本），返回本轮产生的所有新消息。
 
