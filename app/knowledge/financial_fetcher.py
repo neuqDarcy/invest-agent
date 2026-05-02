@@ -9,17 +9,28 @@ from app.knowledge.store import _get_db
 
 
 def _get_pro():
+    """初始化并返回 Tushare Pro API 客户端。"""
     ts.set_token(settings.tushare_token)
     return ts.pro_api()
 
 
-def _to_ts_code(code: str) -> str:
-    if "." in code:
-        return code
-    return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
+def _to_ts_code(stock_code: str) -> str:
+    """
+    将普通股票代码转换为 Tushare 格式（含交易所后缀）。
+
+    参数:
+        stock_code: 如 '600519' 或已含后缀的 '600519.SH'
+
+    返回:
+        Tushare 格式代码，如 '600519.SH' 或 '000858.SZ'
+    """
+    if "." in stock_code:
+        return stock_code
+    # 沪市股票以 6 开头，其余为深市
+    return f"{stock_code}.SH" if stock_code.startswith("6") else f"{stock_code}.SZ"
 
 
-# 利润表字段映射：Tushare字段名 → 标准指标名
+# 利润表字段映射：Tushare 字段名 → 标准中文指标名
 INCOME_FIELDS = {
     "revenue":          "营业收入",
     "total_cogs":       "营业成本",
@@ -51,12 +62,22 @@ CASHFLOW_FIELDS = {
 }
 
 
-def _safe_float(val) -> float | None:
+def _safe_float(raw_value) -> float | None:
+    """
+    安全地将原始值转为 float，无法转换或为 NaN 时返回 None。
+
+    参数:
+        raw_value: 来自 DataFrame 的原始值
+
+    返回:
+        有效的 float 数值，或 None
+    """
     try:
-        if isinstance(val, complex):
+        # 复数类型无法映射到财务指标，直接排除
+        if isinstance(raw_value, complex):
             return None
-        f = float(val)
-        return None if pd.isna(f) else f
+        converted = float(raw_value)
+        return None if pd.isna(converted) else converted
     except (TypeError, ValueError):
         return None
 
@@ -66,20 +87,34 @@ def _fetch_and_save(
     ts_code: str,
     start_date: str,
     end_date: str,
-    report_type: str = "1",   # 1=合并报表（默认）
+    report_type: str = "1",   # 1=合并报表（默认），2=母公司报表
 ):
-    """拉取三张表并存入 SQLite，只保留年报（end_date 末尾为 1231）"""
+    """
+    从 Tushare 拉取三张财务报表并持久化到 SQLite。
+    只保留合并报表中的年报数据（end_date 末尾为 1231）。
+
+    参数:
+        stock_code:  内部使用的股票代码（不含后缀）
+        ts_code:     Tushare 格式代码，如 '600519.SH'
+        start_date:  查询起始日期，格式 YYYYMMDD
+        end_date:    查询截止日期，格式 YYYYMMDD
+        report_type: 报表类型，'1' 为合并报表
+
+    返回:
+        成功写入 SQLite 的指标条数
+    """
     pro = _get_pro()
     saved_count = 0
 
-    tables = [
-        (pro.income,      INCOME_FIELDS,   "revenue"),
-        (pro.balancesheet, BALANCE_FIELDS, "total_assets"),
-        (pro.cashflow,    CASHFLOW_FIELDS,  "n_cashflow_act"),
+    # 三张表的 (API函数, 字段映射, 非空校验字段) 元组列表
+    financial_tables = [
+        (pro.income,       INCOME_FIELDS,   "revenue"),
+        (pro.balancesheet, BALANCE_FIELDS,  "total_assets"),
+        (pro.cashflow,     CASHFLOW_FIELDS, "n_cashflow_act"),
     ]
 
     with _get_db() as conn:
-        for api_func, field_map, check_field in tables:
+        for api_func, field_map, check_field in financial_tables:
             fields = "ts_code,ann_date,end_date,report_type," + ",".join(field_map.keys())
             try:
                 df = api_func(
@@ -88,32 +123,33 @@ def _fetch_and_save(
                     end_date=end_date,
                     fields=fields,
                 )
-            except Exception as e:
-                print(f"拉取失败：{api_func.__name__} — {e}")
+            except Exception as error:
+                print(f"拉取失败：{api_func.__name__} — {error}")
                 continue
 
             if df is None or df.empty:
                 continue
 
-            # 只保留合并报表 + 年报（end_date 以 1231 结尾）
+            # 只保留合并报表 + 年报（end_date 以 1231 结尾），排除季报和半年报
             df = df[df["report_type"] == report_type]
             df = df[df["end_date"].str.endswith("1231")]
-            # 去重：同一期只取最新公告
+            # 同一报告期可能有多次更新公告，取最新一次（ann_date 最大）
             df = df.sort_values("ann_date", ascending=False)
             df = df.drop_duplicates(subset=["end_date"])
 
             for _, row in df.iterrows():
                 year = row["end_date"][:4]
-                period = f"{year}-12-31"
+                # 统一用年末日期作为存储 key，便于跨表关联
+                period_key = f"{year}-12-31"
                 for ts_field, metric_name in field_map.items():
-                    val = _safe_float(row.get(ts_field))
-                    if val is None:
+                    metric_value = _safe_float(row.get(ts_field))
+                    if metric_value is None:
                         continue
                     conn.execute("""
                         INSERT OR REPLACE INTO financial_metrics
                             (stock_code, ann_date, metric_name, value, unit)
                         VALUES (?, ?, ?, ?, ?)
-                    """, (stock_code, period, metric_name, val, "元"))
+                    """, (stock_code, period_key, metric_name, metric_value, "元"))
                     saved_count += 1
 
         conn.commit()
@@ -127,14 +163,22 @@ def fetch_financials(
     end_year: int = 2024,
 ) -> dict:
     """
-    为指定公司拉取三张财务报表存入 SQLite。
-    返回 {stock_code, saved_count, years}
+    为指定公司拉取三张财务报表并存入 SQLite。
+    会先清除该公司的旧数据，再重新写入，保证数据最新。
+
+    参数:
+        stock_code: A 股代码，如 '600519'
+        start_year: 起始年份（含）
+        end_year:   结束年份（含）
+
+    返回:
+        {stock_code, saved_count, years} 字典，years 为已入库的年份列表
     """
     ts_code = _to_ts_code(stock_code)
     start_date = f"{start_year}0101"
     end_date = f"{end_year}1231"
 
-    # 清除该公司旧的财务指标数据（避免重复）
+    # 先清除旧数据，避免历史脏数据干扰后续分析
     with _get_db() as conn:
         conn.execute(
             "DELETE FROM financial_metrics WHERE stock_code=?",
@@ -144,13 +188,13 @@ def fetch_financials(
 
     saved_count = _fetch_and_save(stock_code, ts_code, start_date, end_date)
 
-    # 查一下入库了哪些年份
+    # 回查已入库年份，用于调用方展示覆盖范围
     with _get_db() as conn:
-        rows = conn.execute(
+        year_rows = conn.execute(
             "SELECT DISTINCT ann_date FROM financial_metrics WHERE stock_code=? ORDER BY ann_date DESC",
             (stock_code,)
         ).fetchall()
-    years = [r[0][:4] for r in rows]
+    years = [row[0][:4] for row in year_rows]
 
     return {
         "stock_code": stock_code,

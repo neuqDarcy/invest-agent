@@ -1,6 +1,6 @@
 """
-基金经理可调用的工具集。
-每个工具返回结构化结果，供 Agent 决策使用。
+基金经理 Agent 可调用的工具集。
+每个工具返回结构化文本结果，供 Agent 决策和回答使用。
 """
 import json
 from app.core.logger import get_logger
@@ -14,6 +14,7 @@ from app.valuation.engine import run_valuation
 
 
 # ── 工具定义（供 LLM Tool Use 使用）─────────────────────────────────────────
+# 每个工具定义包含名称、描述和参数 schema，LLM 根据描述决定何时调用哪个工具
 
 TOOL_DEFINITIONS = [
     {
@@ -82,31 +83,46 @@ TOOL_DEFINITIONS = [
 ]
 
 
-# ── 工具执行 ──────────────────────────────────────────────────────────────────
+# ── 工具执行入口 ──────────────────────────────────────────────────────────────
 
-def execute_tool(name: str, inputs: dict) -> str:
-    logger.info(f"工具调用: {name}({json.dumps(inputs, ensure_ascii=False)[:100]})")
+def execute_tool(tool_name: str, tool_inputs: dict) -> str:
+    """
+    工具调用统一入口，根据工具名称路由到对应的执行函数。
+
+    参数：
+        tool_name:   工具名称，须与 TOOL_DEFINITIONS 中的 name 一致
+        tool_inputs: 工具参数字典
+
+    返回：工具执行结果文本，供 LLM 作为观察结果继续推理。
+    """
+    logger.info(f"工具调用: {tool_name}({json.dumps(tool_inputs, ensure_ascii=False)[:100]})")
     try:
-        if name == "deep_screen":
-            return _run_deep_screen(inputs)
-        elif name == "get_financials":
-            return _run_financials(inputs)
-        elif name == "get_valuation":
-            return _run_valuation(inputs)
-        elif name == "ask_knowledge":
-            return _run_ask_knowledge(inputs)
+        if tool_name == "deep_screen":
+            return _run_deep_screen(tool_inputs)
+        elif tool_name == "get_financials":
+            return _run_financials(tool_inputs)
+        elif tool_name == "get_valuation":
+            return _run_valuation(tool_inputs)
+        elif tool_name == "ask_knowledge":
+            return _run_ask_knowledge(tool_inputs)
         else:
-            return f"未知工具：{name}"
-    except Exception as e:
-        return f"工具执行失败（{name}）：{str(e)}"
+            return f"未知工具：{tool_name}"
+    except Exception as error:
+        return f"工具执行失败（{tool_name}）：{str(error)}"
 
 
 def _run_deep_screen(inputs: dict) -> str:
     """
-    两阶段选股：
-    1. daily_basic 量化初筛 → 候选池（最多100只）
-    2. 逐只拉财务数据 → ROE/FCF/负债率二次过滤
-    3. 综合评分排序
+    两阶段深度选股工具的执行逻辑。
+
+    阶段1：调用 screener 按市值/PE/PB/行业量化初筛，最多取100只候选股。
+    阶段2：逐只拉取财务数据，按 ROE/负债率/FCF 做二次过滤。
+    阶段3：综合评分排序，截断至 top_n 返回。
+
+    评分加权逻辑：
+    - 基础分来自 screener（市值、估值等维度）
+    - ROE 越高加分越多（上限 +0.3）
+    - PB 历史分位越低加分越多（低估值溢价）
     """
     import pandas as pd
     import tushare as ts
@@ -116,182 +132,222 @@ def _run_deep_screen(inputs: dict) -> str:
     from app.knowledge.calculator import compute_analytics
     from app.data.stock_data import get_stock_valuation_history, get_pb_percentile
 
-    # ── 阶段1：量化初筛 ────────────────────────────────────────────────
-    criteria = ScreenerCriteria(
+    # ── 阶段1：量化初筛，拿100只候选用于二次过滤 ──────────────────────
+    screen_criteria = ScreenerCriteria(
         market_cap_min=inputs.get("market_cap_min"),
         market_cap_max=inputs.get("market_cap_max"),
         pb_max=inputs.get("pb_max"),
         pe_max=inputs.get("pe_max"),
-        pe_min=inputs.get("pe_min") or 0,  # 默认过滤亏损股
+        pe_min=inputs.get("pe_min") or 0,  # 默认 pe_min=0，过滤亏损股（PE为负）
         industry=inputs.get("industry"),
         exclude_industries=inputs.get("exclude_industries"),
-        top_n=100,  # 初筛拿100只，二次过滤后再截断
+        top_n=100,  # 初筛多拿一些，二次过滤后再截断到 top_n
     )
-    candidates = screen_stocks(criteria)
-    if not candidates:
+    candidate_stocks = screen_stocks(screen_criteria)
+    if not candidate_stocks:
         return "未找到符合初筛条件的股票，请放宽筛选条件。"
 
     # ── 阶段2：财务指标二次过滤 ────────────────────────────────────────
-    roe_min       = inputs.get("roe_min")
-    debt_max      = inputs.get("debt_ratio_max")
-    fcf_positive  = inputs.get("fcf_positive", False)
-    pb_pct_max    = inputs.get("pb_percentile_max")
-    top_n         = inputs.get("top_n", 20)
+    # 从 inputs 中读取二次过滤参数
+    roe_min_threshold      = inputs.get("roe_min")
+    debt_ratio_max_threshold = inputs.get("debt_ratio_max")
+    require_positive_fcf   = inputs.get("fcf_positive", False)
+    pb_percentile_max      = inputs.get("pb_percentile_max")
+    final_top_n            = inputs.get("top_n", 20)
 
-    need_financials = any([roe_min, debt_max, fcf_positive])
-    need_valuation  = pb_pct_max is not None
+    # 判断是否需要拉取财务数据和估值历史（避免不必要的网络请求）
+    need_financials = any([roe_min_threshold, debt_ratio_max_threshold, require_positive_fcf])
+    need_valuation  = pb_percentile_max is not None
 
-    results = []
-    checked = 0
+    qualified_stocks = []   # 通过二次过滤的股票列表
 
-    for stock in candidates:
-        code = stock.code
-        score = stock.score  # 基础评分（来自 screener）
-        extra = {}
+    for stock in candidate_stocks:
+        stock_code = stock.code
+        composite_score = stock.score  # 初始分来自 screener
+        financial_extras = {}          # 二次过滤中计算出的财务指标（用于结果展示）
 
-        # 拉财务数据
+        # 拉取财务数据并计算 ROE/负债率/FCF
         if need_financials:
             try:
-                metrics = get_metrics(code, years=3)
-                if not metrics:
-                    # 本地没有则从 Tushare 拉
-                    end_year = pd.Timestamp.now().year
-                    fetch_financials(code, start_year=end_year - 3, end_year=end_year)
-                    metrics = get_metrics(code, years=3)
+                raw_metrics = get_metrics(stock_code, years=3)
+                if not raw_metrics:
+                    # 本地无数据时从 Tushare 拉取并缓存
+                    current_year = pd.Timestamp.now().year
+                    fetch_financials(stock_code, start_year=current_year - 3, end_year=current_year)
+                    raw_metrics = get_metrics(stock_code, years=3)
 
-                if metrics:
-                    analytics = compute_analytics(metrics)
-                    raw = analytics.get("raw", {})
-                    latest_year = max(raw.keys()) if raw else None
+                if raw_metrics:
+                    analytics = compute_analytics(raw_metrics)
+                    raw_by_year = analytics.get("raw", {})
+                    latest_year = max(raw_by_year.keys()) if raw_by_year else None
 
                     if latest_year:
-                        d = raw[latest_year]
-                        roe_val = None
-                        # ROE = 净利润 / 股东权益
-                        np_val = d.get("净利润")
-                        eq_val = d.get("股东权益合计")
-                        if np_val and eq_val and eq_val != 0:
-                            roe_val = round(np_val / eq_val * 100, 2)
+                        latest_data = raw_by_year[latest_year]
 
-                        debt_val = None
-                        ta = d.get("资产总计")
-                        tl = d.get("负债合计")
-                        if ta and tl and ta != 0:
-                            debt_val = round(tl / ta * 100, 2)
+                        # 计算 ROE = 净利润 / 股东权益合计
+                        roe_value = None
+                        net_profit = latest_data.get("净利润")
+                        shareholders_equity = latest_data.get("股东权益合计")
+                        if net_profit and shareholders_equity and shareholders_equity != 0:
+                            roe_value = round(net_profit / shareholders_equity * 100, 2)
 
-                        fcf_data = analytics.get("fcf", {}).get(latest_year, {})
-                        fcf_val = fcf_data.get("fcf")
+                        # 计算资产负债率 = 负债合计 / 资产总计
+                        debt_ratio_value = None
+                        total_assets = latest_data.get("资产总计")
+                        total_liabilities = latest_data.get("负债合计")
+                        if total_assets and total_liabilities and total_assets != 0:
+                            debt_ratio_value = round(total_liabilities / total_assets * 100, 2)
 
-                        extra = {"roe": roe_val, "debt_ratio": debt_val, "fcf": fcf_val}
+                        # 自由现金流（亿元）
+                        fcf_year_data = analytics.get("fcf", {}).get(latest_year, {})
+                        fcf_value = fcf_year_data.get("fcf")
 
-                        # 过滤
-                        if roe_min and (roe_val is None or roe_val < roe_min):
+                        financial_extras = {
+                            "roe": roe_value,
+                            "debt_ratio": debt_ratio_value,
+                            "fcf": fcf_value,
+                        }
+
+                        # 按阈值过滤（不满足则跳过该股票）
+                        if roe_min_threshold and (roe_value is None or roe_value < roe_min_threshold):
                             continue
-                        if debt_max and (debt_val is None or debt_val > debt_max):
+                        if debt_ratio_max_threshold and (debt_ratio_value is None or debt_ratio_value > debt_ratio_max_threshold):
                             continue
-                        if fcf_positive and (fcf_val is None or fcf_val <= 0):
+                        if require_positive_fcf and (fcf_value is None or fcf_value <= 0):
                             continue
 
-                        # ROE 加权提升评分
-                        if roe_val and roe_val > 0:
-                            score += min(roe_val / 100, 0.3)
+                        # ROE 越高，综合评分加成越大（最多 +0.3，避免单因子主导）
+                        if roe_value and roe_value > 0:
+                            composite_score += min(roe_value / 100, 0.3)
+
             except Exception:
-                if roe_min:  # 有强制财务要求时跳过拉取失败的
+                # 财务数据拉取失败时：有强制财务要求则跳过，否则保留
+                if roe_min_threshold:
                     continue
 
-        # PB历史分位过滤
-        pb_pct_val = None
+        # 计算 PB 历史分位并过滤
+        pb_percentile_value = None
         if need_valuation:
             try:
-                h = get_stock_valuation_history(code)
-                stats = get_pb_percentile(h)
-                pb_pct_val = stats.get("pb_percentile")
-                if pb_pct_max and (pb_pct_val is None or pb_pct_val > pb_pct_max):
+                valuation_history = get_stock_valuation_history(stock_code)
+                pb_stats = get_pb_percentile(valuation_history)
+                pb_percentile_value = pb_stats.get("pb_percentile")
+                if pb_percentile_max and (pb_percentile_value is None or pb_percentile_value > pb_percentile_max):
                     continue
-                if pb_pct_val is not None:
-                    score += (100 - pb_pct_val) / 1000  # 低分位加分
+                if pb_percentile_value is not None:
+                    # 分位越低（越低估）加分越多，最多 +0.1
+                    composite_score += (100 - pb_percentile_value) / 1000
             except Exception:
-                if pb_pct_max:
+                if pb_percentile_max:
                     continue
 
-        results.append({
-            "code": code,
-            "name": stock.name,
-            "industry": stock.industry,
-            "market_cap": stock.market_cap,
-            "price": stock.current_price,
-            "pb": stock.pb,
-            "pe": stock.pe,
-            "roe": extra.get("roe"),
-            "debt_ratio": extra.get("debt_ratio"),
-            "fcf": extra.get("fcf"),
-            "pb_percentile": pb_pct_val,
-            "score": round(score, 4),
+        qualified_stocks.append({
+            "code":         stock_code,
+            "name":         stock.name,
+            "industry":     stock.industry,
+            "market_cap":   stock.market_cap,
+            "price":        stock.current_price,
+            "pb":           stock.pb,
+            "pe":           stock.pe,
+            "roe":          financial_extras.get("roe"),
+            "debt_ratio":   financial_extras.get("debt_ratio"),
+            "fcf":          financial_extras.get("fcf"),
+            "pb_percentile": pb_percentile_value,
+            "score":        round(composite_score, 4),
         })
-        checked += 1
 
-    if not results:
-        return f"初筛得到 {len(candidates)} 只，财务二次过滤后无符合条件的股票，请放宽条件。"
+    if not qualified_stocks:
+        return f"初筛得到 {len(candidate_stocks)} 只，财务二次过滤后无符合条件的股票，请放宽条件。"
 
-    # 排序截断
-    results.sort(key=lambda x: x["score"], reverse=True)
-    results = results[:top_n]
+    # ── 阶段3：按综合评分降序排序，截断至 top_n ────────────────────────
+    qualified_stocks.sort(key=lambda stock_item: stock_item["score"], reverse=True)
+    qualified_stocks = qualified_stocks[:final_top_n]
 
-    lines = [f"筛选结果（初筛{len(candidates)}只 → 财务过滤后{len(results)}只）：\n"]
-    for i, r in enumerate(results, 1):
-        roe_str   = f"ROE={r['roe']:.1f}%" if r['roe'] else ""
-        debt_str  = f"负债率={r['debt_ratio']:.1f}%" if r['debt_ratio'] else ""
-        fcf_str   = f"FCF={r['fcf']:.1f}亿" if r['fcf'] else ""
-        pct_str   = f"PB分位={r['pb_percentile']:.0f}%" if r['pb_percentile'] is not None else ""
-        details   = " ".join(filter(None, [roe_str, debt_str, fcf_str, pct_str]))
-        lines.append(
-            f"{i:2d}. {r['code']} {r['name']}（{r['industry']}）"
-            f"  市值={r['market_cap']}亿  PB={r['pb']}  PE={r['pe']}"
-            f"  {details}"
+    # 格式化输出
+    output_lines = [f"筛选结果（初筛{len(candidate_stocks)}只 → 财务过滤后{len(qualified_stocks)}只）：\n"]
+    for rank, stock_item in enumerate(qualified_stocks, 1):
+        roe_str        = f"ROE={stock_item['roe']:.1f}%"          if stock_item['roe']           else ""
+        debt_ratio_str = f"负债率={stock_item['debt_ratio']:.1f}%" if stock_item['debt_ratio']    else ""
+        fcf_str        = f"FCF={stock_item['fcf']:.1f}亿"          if stock_item['fcf']           else ""
+        pb_pct_str     = f"PB分位={stock_item['pb_percentile']:.0f}%" if stock_item['pb_percentile'] is not None else ""
+        detail_parts   = " ".join(filter(None, [roe_str, debt_ratio_str, fcf_str, pb_pct_str]))
+        output_lines.append(
+            f"{rank:2d}. {stock_item['code']} {stock_item['name']}（{stock_item['industry']}）"
+            f"  市值={stock_item['market_cap']}亿  PB={stock_item['pb']}  PE={stock_item['pe']}"
+            f"  {detail_parts}"
         )
-    return "\n".join(lines)
+    return "\n".join(output_lines)
 
 
 def _run_financials(inputs: dict) -> str:
+    """
+    获取单只股票的完整财务分析。
+
+    若本地无数据，自动从 Tushare 拉取并缓存后再计算。
+
+    参数：
+        inputs: {"stock_code": str, "years": int（可选，默认5）}
+
+    返回：格式化的财务分析文本。
+    """
     from app.knowledge.financial_fetcher import fetch_financials
-    code = inputs["stock_code"]
-    years = inputs.get("years", 5)
+    stock_code = inputs["stock_code"]
+    num_years = inputs.get("years", 5)
 
-    metrics = get_metrics(code, years=years)
-    if not metrics:
+    raw_metrics = get_metrics(stock_code, years=num_years)
+    if not raw_metrics:
+        # 本地无缓存，从 Tushare 拉取
         import datetime
-        end_year = datetime.datetime.now().year
-        fetch_financials(code, start_year=end_year - years, end_year=end_year)
-        metrics = get_metrics(code, years=years)
+        current_year = datetime.datetime.now().year
+        fetch_financials(stock_code, start_year=current_year - num_years, end_year=current_year)
+        raw_metrics = get_metrics(stock_code, years=num_years)
 
-    if not metrics:
-        return f"无法获取 {code} 的财务数据。"
+    if not raw_metrics:
+        return f"无法获取 {stock_code} 的财务数据。"
 
-    analytics = compute_analytics(metrics)
+    analytics = compute_analytics(raw_metrics)
     return format_analytics_for_llm(analytics)
 
 
 def _run_valuation(inputs: dict) -> str:
-    code = inputs["stock_code"]
-    industry = inputs.get("industry_name")
-    result = run_valuation(code, industry_name=industry)
+    """
+    获取股票的 PB 历史分位估值分析。
+
+    参数：
+        inputs: {"stock_code": str, "industry_name": str（可选）}
+
+    返回：格式化的估值分析文本，含买入/卖出参考价格。
+    """
+    stock_code = inputs["stock_code"]
+    industry_name = inputs.get("industry_name")
+    valuation_result = run_valuation(stock_code, industry_name=industry_name)
     return (
-        f"估值分析（{result.model_name}）：\n"
-        f"  当前价格：¥{result.current_price}  状态：{result.current_status}\n"
-        f"  买入参考：≤ ¥{result.buy_price}\n"
-        f"  合理区间：¥{result.fair_value_low} ~ ¥{result.fair_value_high}\n"
-        f"  卖出参考：≥ ¥{result.sell_price}\n"
-        f"{result.reasoning}"
+        f"估值分析（{valuation_result.model_name}）：\n"
+        f"  当前价格：¥{valuation_result.current_price}  状态：{valuation_result.current_status}\n"
+        f"  买入参考：≤ ¥{valuation_result.buy_price}\n"
+        f"  合理区间：¥{valuation_result.fair_value_low} ~ ¥{valuation_result.fair_value_high}\n"
+        f"  卖出参考：≥ ¥{valuation_result.sell_price}\n"
+        f"{valuation_result.reasoning}"
     )
 
 
 def _run_ask_knowledge(inputs: dict) -> str:
-    code = inputs["stock_code"]
+    """
+    基于公司知识库回答定性问题（年报/公告语义检索）。
+
+    若该股票尚未建立知识库，返回提示信息而非报错。
+
+    参数：
+        inputs: {"stock_code": str, "question": str}
+
+    返回：问答结果文本，附带来源标注。
+    """
+    stock_code = inputs["stock_code"]
     question = inputs["question"]
-    result = ask(stock_code=code, question=question)
-    if not result.get("has_data"):
-        return f"{code} 尚未建立知识库，无法回答定性问题。"
-    answer = result.get("answer", "")
-    sources = result.get("sources", [])
-    source_str = "  来源：" + "、".join(sources) if sources else ""
-    return f"{answer}\n{source_str}"
+    qa_result = ask(stock_code=stock_code, question=question)
+    if not qa_result.get("has_data"):
+        return f"{stock_code} 尚未建立知识库，无法回答定性问题。"
+    answer_text = qa_result.get("answer", "")
+    source_list = qa_result.get("sources", [])
+    source_annotation = "  来源：" + "、".join(source_list) if source_list else ""
+    return f"{answer_text}\n{source_annotation}"
